@@ -112,3 +112,6 @@ On the actual site verify: registration/login, password change and sign-out, dis
 External API clients making state-changing requests must retain their session cookie and submit the page's CSRF token through `X-CSRF-Token` or `_csrf`. Legacy destructive admin action links now submit POST through the shared browser script; direct destructive GET requests are rejected.
 
 Live browser/database, actual payment capture/refunds and email delivery were not verified in this workspace. TCP and Unix server sockets are denied here. PHP CGI, failure-injection tests and offline MariaDB checks were used instead.
+
+
+Automatic deployment test completed on 2026-10-21.
