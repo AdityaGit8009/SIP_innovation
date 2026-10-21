@@ -1,0 +1,258 @@
+SIP Innovation project audit
+Date: 2026-10-10
+Verdict: Not ready for production sign-off. Syntax passes, but security,
+order-management, pricing and inventory defects remain.
+
+SCOPE AND EVIDENCE
+- PHP 8.3.14: all 158 PHP files passed php -l.
+- assets/js/script.js and script2.js passed node --check.
+- Reviewed authentication, admin guards, checkout/payment, cancellation,
+  inventory restoration, addresses, registration, uploads and supplied schema.
+- Executed isolated, synthetic reproductions for expired JWT acceptance,
+  admin password-hash acceptance and discounted-price recalculation.
+- Scanned 321 literal local src/href references; 24 distinct targets are absent.
+  This is a static scan, not a browser crawl; comments/dynamic URLs may differ.
+- Supplied database/spiinnovation_current.sql has 45 tables, 39 using MyISAM.
+- WAMP Apache, MySQL and MariaDB services were stopped during review.
+  Live database contents, HTTP behavior, responsive layout, real payment,
+  email delivery and complete end-to-end flows were NOT verified.
+- No application source or database data was changed. Only this report added.
+- No real credentials were tested, payments initiated or messages sent.
+- No automated regression suite or dependency manifest was found. The named
+  test/debug scripts are not a comprehensive test suite. No Git repository
+  was available in this workspace.
+
+PRIORITY FINDINGS
+
+01. CRITICAL - Predictable JWT signing key when JWT_SECRET is missing
+    References: jwt.php:6-11; admin/check_admin.php:18-30;
+    secure_helpers.php:29-36.
+    A fixed fallback key signs authentication cookies. Anyone knowing this
+    source can generate valid tokens when the environment variable is absent,
+    including admin tokens for an existing active admin ID. CLI environment
+    had no JWT_SECRET; web-server environment could not be verified.
+    Fix: require a strong deployment secret, fail closed when absent, rotate
+    the key and invalidate old cookies/sessions.
+
+02. CRITICAL - Admin login accepts the stored password hash as a password
+    Reference: admin/admin_login.php:36-38.
+    After password_verify fails, the migration fallback directly compares
+    the submitted password to the stored value, even if that value is a hash.
+    A leaked hash therefore becomes a usable login credential.
+    Synthetic reproduction of this exact branch returned YES.
+    Fix: remove plaintext fallback and migrate legacy accounts explicitly.
+
+03. HIGH - Credentials embedded in source; test payment configuration active
+    References: config/mail.php:23; config/razorpay.php:10-11.
+    SMTP app password and Razorpay secret are literal source values. The
+    configured Razorpay key is a test key. Validity was intentionally not
+    tested, and secret values are omitted here.
+    Fix: rotate exposed credentials and load secrets from protected deployment
+    configuration. Select the intended payment environment explicitly.
+
+04. HIGH - JWT expiration is never enforced
+    Reference: jwt.php:23-35.
+    decode checks the signature but not exp. A correctly signed token whose
+    exp was one hour in the past was accepted in an isolated PHP test.
+    Browser cookie expiry alone does not invalidate a copied/replayed token.
+    Fix: validate required claims, expiration, token shape and allowed role;
+    provide invalidation after password changes and administrative revocation.
+
+05. HIGH - Admin order update/delete uses a nonexistent column
+    References: admin/orders.php:111,232;
+    database/spiinnovation_current.sql:501-534.
+    Queries select order_number; the supplied orders schema defines order_no.
+    Against that schema, these actions fail with an unknown-column error.
+    PHP 8.3 mysqli exceptions can terminate the action before its update.
+    Fix: use order_no consistently, including audit-log metadata.
+
+06. HIGH - Transaction rollback cannot protect supplied order tables
+    References: place_order_action.php:306,490-493;
+    database/spiinnovation_current.sql:152,452,481,534,641,1285.
+    cart, order_items, order_status_history, orders, products and transactions
+    use MyISAM in the supplied dump. A later failed insert can leave earlier
+    writes and stock changes persisted despite mysqli_rollback.
+    Fix: migrate related tables to InnoDB with a reviewed migration and verify
+    rollback behavior. Confirm actual deployed engines before migration.
+
+07. HIGH - Concurrent checkout can sell more units than are available
+    References: place_order_action.php:163-175,306,413-419.
+    Stock is checked before the transaction. The later UPDATE clamps stock
+    with GREATEST(stock-qty,0) and never verifies sufficient remaining stock.
+    Two buyers can both pass the initial check for the final unit.
+    Fix: reserve/decrement stock atomically with a quantity predicate and
+    affected-row checks, or lock rows inside a transactional checkout.
+
+08. HIGH - Cancellation changes a paid order to Refunded without a refund
+    References: cancel_order.php:30-42; admin/ajax/update_refund.php:17.
+    Customer cancellation changes payment_status to Refunded through SQL.
+    No provider refund request or verified refund confirmation occurs on this
+    path. The admin refund endpoint also only changes a database label.
+    Fix: distinguish requested/pending/successful refunds and mark Refunded
+    only after a real provider refund or an explicitly recorded manual refund.
+
+09. HIGH - Cancelling a project can increase an unrelated product's stock
+    Reference: order_helpers.php:150-156.
+    Restoration reads every order item's product_id and qty, ignores item_type,
+    and always updates products. Project ID 1 can therefore add inventory to
+    product ID 1. Its stock_restored check/update is also non-atomic, so parallel
+    cancellation requests can restore inventory twice.
+    Fix: restore only product rows and claim restoration atomically inside a
+    transaction with the order-status transition.
+
+10. HIGH - Discounted products have inconsistent cart and checkout prices
+    References: ecom_pricing.php:47-65; cart.php:54,226;
+    update_cart.php:117; checkout.php:72; admin/products.php:79-83.
+    Admin saves a discounted price, but ecom_product_price recalculates the
+    final value from base price and taxes without applying the discount.
+    Reproduction: base 100, service 2%, GST 18%, discount 10%, saved price
+    108.32 -> cart helper returns 120.36. Checkout uses the saved price.
+    Fix: establish one authoritative pricing function and rounding rule shared
+    by product display, cart updates, checkout, payment and invoices.
+
+11. HIGH - Destructive admin actions use GET without CSRF protection
+    References: admin/products.php:168-189; admin/admins.php:117,139;
+    admin/roles.php:47,60; remove_address.php:5,24.
+    Delete/status changes are performed directly from query parameters. No
+    CSRF-token validation was found in PHP sources. SameSite=Lax does not
+    prevent authenticated top-level cross-site GET navigation.
+    Fix: POST-only mutations with verified CSRF tokens and appropriate origin
+    checks. Apply consistently to all state-changing customer/admin routes.
+
+12. HIGH - Razorpay TLS certificate verification disabled
+    Reference: razorpay_create_order.php:203-204.
+    Both peer and hostname verification are disabled in the active API call.
+    Fix: configure a trusted CA bundle and enable peer/hostname verification.
+
+13. HIGH - Maintenance scripts can mutate state without authentication
+    References: z_update_db.php:2-22; z_update_db_advanced.php:2-38;
+    clean.php:2-5; replace_styles.php:2-8; mail_test.php:2-13;
+    dump_output.php:2-5.
+    These web-root scripts have no login or CLI-only guard and can alter schema,
+    delete rows, overwrite files or send email when directly requested.
+    They were not executed during this audit.
+    Fix: remove them from deployments or move to authenticated/CLI-only tooling.
+
+14. HIGH (deployment-dependent) - Database exports and invoices in web root
+    References: database/spiinnovation_current.sql; database/spiinnovation (3).sql;
+    includes/InvoicePdf.php:399-408; includes/InvoiceTemplate.php:276-281.
+    SQL exports contain account/customer/order data. Generated invoices are
+    written under uploads/invoices with predictable invoice-derived names.
+    No repository .htaccess protects these paths. External Apache rules were
+    not verified, so actual public downloadability is not claimed as tested.
+    Fix: keep exports and private invoices outside the document root; serve
+    invoices through an authenticated ownership-checking endpoint.
+
+15. MEDIUM - Cart unique key conflicts with product/project support
+    References: database/spiinnovation_current.sql:142-152;
+    AJAX/add_to_cart.php:31,52.
+    App distinguishes (user_id, product_id, item_type), but the unique key uses
+    only (user_id, product_id). Adding a product and project with the same ID
+    attempts a duplicate-key insert instead of retaining both cart rows.
+    Fix: migrate the unique index to include item_type, after checking existing
+    data and intended cart identity.
+
+16. MEDIUM - Legitimate admin routes missing from permissions map
+    References: admin/check_admin.php:65-130,148-150.
+    bulk_upload_projects.php, refunds.php and ajax/update_refund.php include
+    the admin guard but are absent from its route map. Non-super admins are
+    denied even with projects/orders permissions; AJAX receives a redirect
+    instead of the expected JSON. Refunds is displayed under the orders menu.
+    Fix: map each route explicitly and return suitable JSON/403 for API denials.
+
+17. MEDIUM - Bulk stock/price templates and redirects point to missing files
+    References: admin/bulk_stock.php:39,46,83,87,229,256;
+    admin/bulk_price.php:39,46,83,87,229,256.
+    Links/redirects use bulk_stock_update.php and bulk_price_update.php, but
+    actual files are bulk_stock.php and bulk_price.php. Templates fail and a
+    successful upload redirects to a missing page.
+    Fix: use existing route names consistently.
+
+18. MEDIUM - Delivery address model cannot capture a full street address
+    References: manage-addresses.php:24-30,55-73; save_address.php:15-28;
+    database/spiinnovation_current.sql:289-302; invoice.php:44-84.
+    Forms/storage include city/state/pincode but no house/street/area fields.
+    Invoice attempts to read house_no, area and landmark, which are absent
+    from the supplied schema and save paths. Physical delivery information is
+    incomplete even though the UI allows checkout.
+    Fix: add and validate address lines; snapshot the shipping address on the
+    order so editing/deleting a saved address does not rewrite order history.
+
+19. MEDIUM - Registration can leave a user without a login account
+    Reference: register.php:44-67.
+    Uniqueness is checked only in users, then users and login are inserted
+    separately without a transaction. A login-table conflict/failure after the
+    users insert leaves an orphan record and blocks re-registration.
+    Fix: validate both identities and atomically insert on transactional tables;
+    handle duplicate conflicts with a controlled response.
+
+20. MEDIUM - Disabled user checks are not centralized
+    References: secure_helpers.php:14-37; header.php:20-46;
+    AJAX/add_to_cart.php:7; AJAX/request_refund.php:7; user_profile.php:13.
+    ecom_user_id trusts an existing session or restores a user from JWT/users
+    without checking login.status. The status check lives in the page header;
+    direct endpoints can mutate state without running it. A disabled user's
+    existing session/token can therefore continue through these routes.
+    Fix: enforce active-account status in the shared authentication guard.
+
+ADDITIONAL OBSERVATIONS
+- apply_coupon.php:75 stores applied_coupon, but no cart/checkout/payment/order
+  path reads it. A direct successful apply response does not change the order
+  total. The current visible checkout does not integrate the coupon flow.
+- Order confirmation email is sent at place_order_action.php:438 before the
+  transactions insert and commit at 457-490; a later failure can produce a
+  confirmation for an incomplete order. Send after a successful commit with
+  retry-safe delivery handling.
+- Product/project names and shipping addresses are looked up from mutable
+  catalog/address records for historical orders. Use order-time snapshots.
+- No session_regenerate_id call or login attempt throttling was found.
+- Product uploads mostly validate filename extensions; service logo uploads
+  allow SVG without sanitization. Add content/size validation and appropriate
+  serving restrictions, particularly for directly navigable SVG files.
+- save_address.php accepts district while assets/js/script2.js sends city to
+  checkout.php and expects JSON. That legacy script's use in the current UI
+  was not confirmed; remove or reconcile unused address implementations.
+- Configured payment_methods and delivery zones are not enforced by the active
+  checkout flow, which uses COD/online and per-product delivery charges.
+
+MISSING STATIC LINK/ASSET TARGETS (24; validate visible routes before cleanup)
+  ./assets/images/no-image.svg       header.php:801
+  assets/images/no-image.png         footer.php:2856,2919,2956
+  bulk_price_update.php              admin/bulk_price.php:229,256
+  bulk_stock_update.php              admin/bulk_stock.php:229,256
+  advisory-board.php                 site-map.php:150
+  apprenticeship.php                 site-map.php:175
+  arduino.php                        site-map.php:190
+  associations.php                   site-map.php:149
+  awards.php                         site-map.php:199
+  certification-programs.php         site-map.php:201
+  faculty-development-program.php    site-map.php:176
+  faq.php                            site-map.php:204
+  full-stack-certification-program.php site-map.php:177
+  java-springboot.php                site-map.php:188
+  mern-stack.php                     site-map.php:192
+  newsletters.php                    site-map.php:200
+  pcb-designing.php                  site-map.php:191
+  php-laravel.php                    site-map.php:187
+  press.php                          site-map.php:205
+  python-data-science.php            site-map.php:185
+  python-django.php                  site-map.php:186
+  python-ml.php                      site-map.php:184
+  recognitions.php                   site-map.php:202
+  recruiters.php                     site-map.php:203
+
+FIX AND VERIFICATION ORDER
+1. Fix authentication bypasses, rotate secrets, restrict exposed maintenance
+   scripts/private files, enforce CSRF and restore TLS verification.
+2. Correct order queries; migrate transactional tables carefully; implement
+   atomic stock reservation/restoration and accurate refund transitions.
+3. Unify pricing, repair cart identity and complete the shipping address model.
+4. Repair admin route permissions, registration consistency and broken links.
+5. On a disposable database and payment sandbox, verify registration/login,
+   disabled-account access, admin role boundaries, mixed product/project cart,
+   discounted totals, COD/online orders, stock contention, cancellation/refunds,
+   order updates, invoices, bulk imports and rollback on injected failures.
+6. Run desktop/mobile browser checks and verify external services separately.
+
+This review identifies concrete defects; it is not a claim that every possible
+bug has been found or that an end-to-end production audit has passed.

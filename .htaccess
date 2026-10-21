@@ -1,0 +1,4 @@
+Options -Indexes
+<FilesMatch "(^\.|\.(sql|log|bak|env)$|^PROJECT_AUDIT\.txt$|^output_test\.html$)">
+    Require all denied
+</FilesMatch>
