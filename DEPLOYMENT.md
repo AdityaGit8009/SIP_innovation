@@ -1,5 +1,7 @@
 # Required deployment steps
 
+The [project README](README.md) lists the files needed for a local checkout and the tests you can run before configuring a database.
+
 Apply the schema migration before serving the updated application. Several old tables use MyISAM and cannot roll back orders. The updated application refuses transactional writes on those tables rather than silently partially saving an order.
 
 ## 1. Back up and migrate
